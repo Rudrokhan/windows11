@@ -1,0 +1,38 @@
+name: Windows Tailscale RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-rdp:
+    runs-on: windows-latest
+
+    steps:
+      - name: Enable Windows Remote Desktop
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -value 0
+
+      - name: Set Runner Password
+        run: |
+          $Password = ConvertTo-SecureString "Passw0rd1234!#" -AsPlainText -Force
+          Set-LocalUser -Name "runneradmin" -Password $Password
+
+      - name: Install and Connect Tailscale
+        shell: powershell
+        run: |
+          # Download and install Tailscale MSI silently
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile "tailscale-setup.exe"
+          Start-Process -FilePath ".\tailscale-setup.exe" -ArgumentList "/quiet" -Wait
+
+          # Add Tailscale installation directory to the session PATH
+          $env:Path += ";C:\Program Files\Tailscale"
+
+          # Bring Tailscale up using your auth key and custom hostname
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=github-windows-rdp --accept-routes
+
+      - name: Keep Runner Session Alive
+        run: |
+          Write-Host "Tailscale connected successfully. Hostname: github-windows-rdp"
+          while ($true) { Start-Sleep -Seconds 300 }
