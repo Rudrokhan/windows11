@@ -1,38 +1,61 @@
-name: Windows Tailscale RDP
+name: Windows Tailscale RDP (Persistent Sync)
 
 on:
-  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *' # Runs automatically every 6 hours
+  workflow_dispatch: # Allows manual triggering anytime
 
 jobs:
   windows-rdp:
     runs-on: windows-latest
 
     steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
       - name: Enable Windows Remote Desktop
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -value 0
+          *Verification:* Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" | Select-Object -ExpandProperty fDenyTSConnections
+        shell: powershell
 
       - name: Set Runner Password
         run: |
           $Password = ConvertTo-SecureString "Passw0rd1234!#" -AsPlainText -Force
           Set-LocalUser -Name "runneradmin" -Password $Password
+          *Verification:* Get-LocalUser -Name "runneradmin" | Select-Object Enabled
+        shell: powershell
 
       - name: Install and Connect Tailscale
-        shell: powershell
         run: |
-          # Download and install Tailscale MSI silently
           Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile "tailscale-setup.exe"
           Start-Process -FilePath ".\tailscale-setup.exe" -ArgumentList "/quiet" -Wait
-
-          # Add Tailscale installation directory to the session PATH
           $env:Path += ";C:\Program Files\Tailscale"
-
-          # Bring Tailscale up using your auth key and custom hostname
           & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=github-windows-rdp --accept-routes
+          *Verification:* & "C:\Program Files\Tailscale\tailscale.exe" status
+        shell: powershell
 
-      - name: Keep Runner Session Alive
+      - name: Live Work Session & Auto-Backup Loop
         run: |
-          Write-Host "Tailscale connected successfully. Hostname: github-windows-rdp"
-          while ($true) { Start-Sleep -Seconds 300 }
+          Write-Host "RDP Session active via Tailscale. Any changes made inside the repository folder will be auto-saved."
+          
+          # This loop keeps the runner alive and automatically commits changes every 10 minutes
+          while ($true) {
+            Start-Sleep -Seconds 600
+            
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "github-actions[bot]@users.noreply.github.com"
+            
+            git add -A
+            $status = git status --porcelain
+            if (-not [string]::IsNullOrEmpty($status)) {
+              git commit -m "Auto-save session progress: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+              git push
+              Write-Host "Changes successfully backed up to repository."
+            }
+          }
+        shell: powershell
