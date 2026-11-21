@@ -1,9 +1,13 @@
-name: Windows Tailscale RDP (Persistent Sync)
+name: Windows Tailscale RDP (Backup & Restore)
 
 on:
-  schedule:
-    - cron: '0 */6 * * *' # Runs automatically every 6 hours
-  workflow_dispatch: # Allows manual triggering anytime
+  workflow_dispatch:
+  repository_dispatch:
+    types: [restart-rdp]
+
+permissions:
+  contents: write
+  actions: write
 
 jobs:
   windows-rdp:
@@ -14,48 +18,107 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: true
+          fetch-depth: 0
+
+      - name: Restore Previous Session Data
+        shell: powershell
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          New-Item -ItemType Directory -Force -Path ".\session_data" | Out-Null
+          git fetch origin session-backup 2>$null
+
+          if ($LASTEXITCODE -eq 0) {
+            git checkout origin/session-backup -- session_data 2>$null
+            Write-Host "Restored session_data from session-backup branch."
+          } else {
+            Write-Host "No prior session-backup branch found; starting with clean session_data folder."
+          }
+
+          if (-not (Test-Path ".\session_data")) {
+            throw "Failed to initialize session_data directory"
+          }
 
       - name: Enable Windows Remote Desktop
+        shell: powershell
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -value 0
-          *Verification:* Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" | Select-Object -ExpandProperty fDenyTSConnections
-        shell: powershell
+          $rdpDisabled = Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" | Select-Object -ExpandProperty fDenyTSConnections
+          if ($rdpDisabled -ne 0) { throw "Failed to enable RDP" }
 
       - name: Set Runner Password
+        shell: powershell
         run: |
           $Password = ConvertTo-SecureString "Passw0rd1234!#" -AsPlainText -Force
           Set-LocalUser -Name "runneradmin" -Password $Password
-          *Verification:* Get-LocalUser -Name "runneradmin" | Select-Object Enabled
-        shell: powershell
 
       - name: Install and Connect Tailscale
+        shell: powershell
         run: |
           Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile "tailscale-setup.exe"
           Start-Process -FilePath ".\tailscale-setup.exe" -ArgumentList "/quiet" -Wait
           $env:Path += ";C:\Program Files\Tailscale"
           & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=github-windows-rdp --accept-routes
-          *Verification:* & "C:\Program Files\Tailscale\tailscale.exe" status
-        shell: powershell
+          & "C:\Program Files\Tailscale\tailscale.exe" status
 
-      - name: Live Work Session & Auto-Backup Loop
+      - name: Run Session with Periodic Backup Before Timeout
+        shell: powershell
         run: |
-          Write-Host "RDP Session active via Tailscale. Any changes made inside the repository folder will be auto-saved."
-          
-          # This loop keeps the runner alive and automatically commits changes every 10 minutes
-          while ($true) {
-            Start-Sleep -Seconds 600
-            
-            git config --global user.name "github-actions[bot]"
-            git config --global user.email "github-actions[bot]@users.noreply.github.com"
-            
-            git add -A
+          # Run for 5 hours 40 minutes (20400s) so backup & next-run dispatch finish before 6h limit
+          $maxSeconds = 20400
+          $stepSeconds = 600
+          $elapsed = 0
+
+          while ($elapsed -lt $maxSeconds) {
+            Start-Sleep -Seconds $stepSeconds
+            $elapsed += $stepSeconds
+
+            git add -f session_data 2>$null
             $status = git status --porcelain
             if (-not [string]::IsNullOrEmpty($status)) {
-              git commit -m "Auto-save session progress: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-              git push
-              Write-Host "Changes successfully backed up to repository."
+              $currentBranch = git rev-parse --abbrev-ref HEAD
+              git checkout -B session-backup
+              git add -f session_data
+              git commit -m "Periodic backup [skip ci]: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+              git push -f origin session-backup
+              git checkout $currentBranch
+              Write-Host "Backed up session_data at $elapsed seconds."
             }
           }
+
+      - name: Final Backup Before Runner Teardown
+        if: always()
         shell: powershell
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          if (Test-Path ".\session_data") {
+            git checkout -B session-backup
+            git add -f session_data
+            $status = git status --porcelain
+            if (-not [string]::IsNullOrEmpty($status)) {
+              git commit -m "Final pre-wipe backup [skip ci]: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+              git push -f origin session-backup
+              Write-Host "Final backup pushed to session-backup."
+            } else {
+              Write-Host "No new changes in session_data to back up."
+            }
+          }
+
+      - name: Trigger Next Run After Backup
+        if: always()
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept        = "application/vnd.github+json"
+          }
+          $body = @{ event_type = "restart-rdp" } | ConvertTo-Json
+          Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/${{ github.repository }}/dispatches" -Headers $headers -Body $body
+          Write-Host "Dispatched next RDP run."
